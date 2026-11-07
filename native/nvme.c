@@ -381,7 +381,7 @@ static void nvme_execute(struct oa_hba *hba, struct oa_srb *srb)
     oa_blockemu_execute(&c->ns[srb->target].emu, srb);
 }
 
-static const struct oa_hba_ops nvme_ops = { nvme_execute, 0 };
+static const struct oa_hba_ops nvme_ops = { nvme_execute, 0, 0 };
 
 /* Space-padded identify string to a C string. */
 static void ident_string(char *out, const oa_u8 *in, unsigned size)
