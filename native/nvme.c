@@ -60,6 +60,7 @@ struct queue {
     oa_u16 qid;
     oa_u16 sq_tail, cq_head;
     oa_u8 phase;
+    oa_host_event *ev;   /* completion event, NULL = poll this queue */
 };
 
 struct ctrl;
@@ -154,9 +155,22 @@ static int queue_alloc(struct queue *q, oa_u16 qid)
     return 0;
 }
 
-/* Submit one command (16 dwords, the command id is filled in) and poll for
- * its completion. Returns OA_HOST_OK with the NVMe status (0: success) in
- * *status, else OA_HOST_TIMEOUT. */
+/* An I/O completion queue's MSI-X vector. One controller runs one I/O command
+ * at a time, so the handler just wakes the submitter, which re-checks the phase
+ * bit. MSI-X is an edge message -- nothing to clear here. */
+static volatile int nvme_irq_seen;  /* an NVMe interrupt was delivered + handled */
+static int nvme_irq_logged;
+static void nvme_irq(void *arg)
+{
+    struct queue *q = arg;
+    nvme_irq_seen = 1;
+    oa_host_event_signal(q->ev);
+}
+
+/* Submit one command (16 dwords, the command id is filled in) and wait for its
+ * completion -- blocking on the queue's MSI-X event when it has one, else
+ * polling the phase bit. Returns OA_HOST_OK with the NVMe status (0: success)
+ * in *status, else OA_HOST_TIMEOUT. */
 static int submit(struct ctrl *c, struct queue *q, oa_u32 cmd[16], oa_u32 timeout_ms,
                   oa_u16 *status, oa_u32 *result)
 {
@@ -173,6 +187,8 @@ static int submit(struct ctrl *c, struct queue *q, oa_u32 cmd[16], oa_u32 timeou
     }
     q->sq_tail = (oa_u16)((q->sq_tail + 1u) % QUEUE_ENTRIES);
     oa_host_mb(); /* the entry before the doorbell */
+    if (q->ev)
+        oa_host_event_reset(q->ev); /* arm before ringing, so no completion is missed */
     wr32(c, REG_DOORBELL + (2u * q->qid) * c->dstrd, q->sq_tail);
 
     end = oa_host_time_us() + (oa_u64)(timeout_ms ? timeout_ms : 30000u) * 1000u;
@@ -180,11 +196,17 @@ static int submit(struct ctrl *c, struct queue *q, oa_u32 cmd[16], oa_u32 timeou
         e = q->cq + 4u * q->cq_head;
         dw3 = e[3];
         if (((dw3 >> 16) & 1u) == q->phase) {
+            if (q->ev && nvme_irq_seen && !nvme_irq_logged) {
+                nvme_irq_logged = 1;
+                oa_host_log(OA_LOG_INFO, "NVMe: interrupt-driven completion\n");
+            }
             break;
         }
         if (oa_host_time_us() > end) {
             return OA_HOST_TIMEOUT;
         }
+        if (q->ev)
+            oa_host_event_wait(q->ev, 1000u); /* sleep on the IRQ, re-check on wake */
     }
     oa_host_mb(); /* the completion before the data */
     if (result) {
@@ -410,7 +432,9 @@ static int create_io_queues(struct ctrl *c)
     cmd[6] = (oa_u32)c->io.cq_bus;
     cmd[7] = (oa_u32)(c->io.cq_bus >> 32);
     cmd[10] = ((QUEUE_ENTRIES - 1u) << 16) | 1u; /* size, qid 1 */
-    cmd[11] = 1u;                                /* physically contiguous, no interrupts */
+    /* physically contiguous; when the I/O queue has an MSI-X event, enable
+     * interrupts (IEN) on vector 0 (the table entry oa_host_pci_msix bound) */
+    cmd[11] = c->io.ev ? 0x3u : 0x1u;
     if (submit(c, &c->admin, cmd, 5000, &status, 0) != OA_HOST_OK || status) {
         return -1;
     }
@@ -535,6 +559,16 @@ int nvmeaspi_probe(oa_u32 pci)
     c->max_bytes = PRP_ENTRIES * PAGE;
     if (mdts != 0u && mdts < 9u && (PAGE << mdts) < c->max_bytes) {
         c->max_bytes = PAGE << mdts;
+    }
+    /* Interrupt-driven I/O completions: bind one MSI-X vector (table entry 0)
+     * to the I/O completion queue, which is then created with IEN on vector 0.
+     * The admin queue stays polled -- it is used only during this init. On any
+     * failure the I/O queue keeps polling (ev stays NULL), so a controller
+     * without working MSI-X never regresses. */
+    c->io.ev = oa_host_event_create();
+    if (c->io.ev && oa_host_pci_msix(pci, nvme_irq, &c->io) < 0) {
+        oa_host_event_destroy(c->io.ev);
+        c->io.ev = 0;
     }
     if (create_io_queues(c) < 0) {
         oa_host_log(OA_LOG_WARN, "NVMe: cannot create the I/O queues\n");
